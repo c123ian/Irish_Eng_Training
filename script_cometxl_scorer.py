@@ -4,44 +4,83 @@ import json
 
 app = modal.App("comet-predict")
 
+# model stored in volume after running download_cometxxl.py script
+MODELS_DIR = "/comet_model"
+MODEL_NAME = "Unbabel/wmt23-cometkiwi-da-xxl"
+
+# Time constants
+MINUTES = 60
+HOURS = 60 * MINUTES
+
+# Create or access the volume (set to True)
+volume = modal.Volume.from_name("comet_model", create_if_missing=False)
+
+# Define the Modal image with necessary packages
 image = (
-    modal.Image.debian_slim()
-    .pip_install("unbabel-comet", "huggingface_hub")
+    modal.Image.debian_slim(python_version="3.10")
+    .pip_install(
+        [
+            "huggingface_hub",  # Download models from the Hugging Face Hub
+            "hf-transfer",      # Download models faster with Rust
+            "unbabel-comet",     # For tokenizer and model handling
+        ]
+    )
+    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
 )
 
-# Store the model in a global variable to avoid reloading it
-model_cache = {}
+# Function to download the model thats stored in the modal.volume (download_cometxxl.py)
+@app.function(volumes={MODELS_DIR: volume}, timeout=4 * HOURS)
+def download_model(model_name, force_download=False):
+    from huggingface_hub import snapshot_download
+    from transformers import AutoTokenizer
 
-@app.function(
+    # Reload the volume to get the latest state
+    volume.reload()
+
+@app.cls(
     image=image,
     timeout=900,
-    cpu=8.0,
-    secrets=[modal.Secret.from_name("huggingface-token-2")]
+    gpu=modal.gpu.A100(count=1, size="80GB"),
+    allow_concurrent_inputs=100,
+    secrets=[modal.Secret.from_name("huggingface-token-2")],
+    volumes={MODELS_DIR: volume}
 )
-def comet_predict(model_name, data, batch_size=8):
-    from comet import download_model, load_from_checkpoint
-    from huggingface_hub import login
-    import torch
+class CometPredictor:
+    @modal.enter()
+    def load_model(self):
+        from comet import load_from_checkpoint
+        import torch
+        
+        # Set higher precision for better performance
+        torch.set_float32_matmul_precision('high')
+        
+        # Load model once when the class is instantiated
+        checkpoint_path = self.find_checkpoint_file(MODELS_DIR)
+        if not checkpoint_path:
+            raise Exception(f"Could not find checkpoint file in {MODELS_DIR}/checkpoints")
+        
+        self.model = load_from_checkpoint(checkpoint_path)
     
-    # Load the model only if it is not already loaded
-    if model_name not in model_cache:
-        huggingface_token = os.getenv("HUGGINGFACE_TOKEN")
-        login(token=huggingface_token, add_to_git_credential=False)
-        model_path = download_model(model_name)
-        model = load_from_checkpoint(model_path)
-        model_cache[model_name] = model
-    else:
-        model = model_cache[model_name]
+    @staticmethod
+    def find_checkpoint_file(base_dir):
+        checkpoint_dir = os.path.join(base_dir, "checkpoints")
+        if os.path.exists(checkpoint_dir):
+            checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.endswith('.ckpt')]
+            if checkpoint_files:
+                return os.path.join(checkpoint_dir, checkpoint_files[0])
+        return None
     
-    model_output = model.predict(data, batch_size=batch_size)
-    segment_scores = model_output.scores
-    system_score = model_output.system_score
-    
-    return segment_scores, system_score
+    @modal.method()
+    def predict(self, data, batch_size=32):
+        model_output = self.model.predict(data, batch_size=batch_size)
+        return model_output.scores, model_output.system_score
 
 def preprocess_data(input_data):
     processed_data = []
     for item in input_data:
+        # Skip items missing the required keys
+        if "en" not in item or "ga" not in item or "gpt_4_ga" not in item or "gpt_4_en" not in item:
+            continue
         processed_data.append({
             "src": item["en"],
             "mt": item["gpt_4_ga"],
@@ -66,10 +105,12 @@ def preprocess_data(input_data):
 
 @app.local_entrypoint()
 def main():
+    BATCH_SIZE = 32  # Process predictions in batches
+    
     input_data = []
     try:
         # Open the input file with UTF-8 encoding
-        with open('Tatoeba_translated.jsonl', 'r', encoding='utf-8') as f:
+        with open('translated.jsonl', 'r', encoding='utf-8') as f:
             for line in f:
                 try:
                     input_data.append(json.loads(line))
@@ -79,33 +120,41 @@ def main():
         print(f"UnicodeDecodeError encountered: {e}")
 
     processed_data = preprocess_data(input_data)
+    total_items = len(processed_data)
+    print(f"Total items to process: {total_items}")
     
-    # Open the output file in append mode
-    with open('Tatoeba_translated_RESULT.jsonl', 'a', encoding='utf-8') as f:
-        for i, item in enumerate(processed_data):
-            try:
-                segment_scores, system_score = comet_predict.remote("Unbabel/wmt23-cometkiwi-da-xl", [item])
-                
-                result = {
-                    "src": item["src"],
-                    "mt": item["mt"],
-                    "direction": item["direction"],
-                    "cometkiwi_score": segment_scores[0],
-                    "system_score": system_score
-                }
-                
-                # Write the result to the file immediately
-                json.dump(result, f, ensure_ascii=False)
-                f.write('\n')
-                
-                # Flush the file to ensure it's written to disk
-                f.flush()
-                
-                print(f"Processed item {i+1}/{len(processed_data)}")
-            except Exception as e:
-                print(f"Error processing item {i+1}: {str(e)}")
-                # Optionally, you can log the error or the problematic item for later investigation
-                
-if __name__ == "__main__":
-    modal.run(main)
+    # Create predictor instance without 'with' statement
+    predictor = CometPredictor()
+    
+    # Process in batches, but write individually
+    for i in range(0, len(processed_data), BATCH_SIZE):
+        batch = processed_data[i:i + BATCH_SIZE]
+        try:
+            # Process entire batch at once
+            segment_scores, system_score = predictor.predict.remote(batch, batch_size=BATCH_SIZE)
+            
+            # Write results individually, but from batched predictions
+            with open('translated_gaois_graded.jsonl', 'a', encoding='utf-8') as f:
+                for j, item in enumerate(batch):
+                    result = {
+                        "src": item["src"],
+                        "mt": item["mt"],
+                        "direction": item["direction"],
+                        "cometkiwi_score": segment_scores[j],
+                        "system_score": system_score
+                    }
+                    json.dump(result, f, ensure_ascii=False)
+                    f.write('\n')
+                    f.flush()  # Keep the flush for safety
+                    
+                    print(f"Processed item {i+j+1}/{total_items}")
+            
+        except Exception as e:
+            print(f"Error processing batch starting at item {i}: {str(e)}")
+            continue  # Skip to next batch if there's an error
 
+    # Commit the changes to the volume
+    volume.commit()
+
+if __name__ == "__main__":
+    modal.run()  # Automatically use the entrypoint from @app.local_entrypoint
