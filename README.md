@@ -49,7 +49,10 @@ We grade the translations `script_cometxl_scorer.py `which also formats the data
 "system_score": 0.8342427015304565}
 
 {"src": "Go raibh míle maith agat!", 
-"mt": "Thank you very much!", "direction": "ga-en", "cometkiwi_score": 0.8411319851875305, "system_score": 0.8411319851875305}
+"mt": "Thank you very much!",
+"direction": "ga-en",
+"cometkiwi_score": 0.8411319851875305,
+"system_score": 0.8411319851875305}
 ```
 
 Once graded, we format it a final time to what DPO would expect using `script_preference_ds_formatter.py` and the higher rated translations are placed in `accepted` and the latter in `rejected`. 
